@@ -1,0 +1,98 @@
+// src/utils.rs
+use byteorder::{ByteOrder, NetworkEndian};
+use core::net::Ipv4Addr;
+use core::hash::Hasher;
+
+// In a real stack, this should be a random value generated at startup.
+const SECRET_KEY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+pub fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let len = data.len();
+    let mut i = 0;
+
+    while i < len - 1 {
+        let word = NetworkEndian::read_u16(&data[i..i + 2]);
+        sum += word as u32;
+        i += 2;
+    }
+
+    if len % 2 != 0 {
+        sum += (data[len - 1] as u32) << 8;
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !(sum as u16)
+}
+
+/// TCP Checksum includes a "pseudo-header" of IP addresses
+pub fn tcp_checksum(src_ip: Ipv4Addr, dest_ip: Ipv4Addr, tcp_data: &[u8]) -> u16 {
+    let mut pseudo_header = alloc::vec::Vec::with_capacity(12 + tcp_data.len());
+
+    pseudo_header.extend_from_slice(&src_ip.octets());
+    pseudo_header.extend_from_slice(&dest_ip.octets());
+    pseudo_header.push(0);  // Reserved
+    pseudo_header.push(6);  // Protocol TCP
+
+    let mut len_buf = [0u8; 2];
+    NetworkEndian::write_u16(&mut len_buf, tcp_data.len() as u16);
+    pseudo_header.extend_from_slice(&len_buf);
+
+    pseudo_header.extend_from_slice(tcp_data);
+
+    checksum(&pseudo_header)
+}
+
+/// A simple Jenkins Hash implementation
+/// This allows us to hash without OS dependency.
+struct JenkinsHasher {
+    hash: u64,
+}
+
+impl JenkinsHasher {
+    fn new() -> Self {
+        Self { hash: 0 }
+    }
+}
+
+impl Hasher for JenkinsHasher {
+    fn finish(&self) -> u64 {
+        let mut h = self.hash;
+        h = h.wrapping_add(h << 3);
+        h ^= h >> 11;
+        h = h.wrapping_add(h << 15);
+        h
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.hash = self.hash.wrapping_add(byte as u64);
+            self.hash = self.hash.wrapping_add(self.hash << 10);
+            self.hash ^= self.hash >> 6;
+        }
+    }
+}
+
+/// Generates a stateless TCP Sequence Number (SYN Cookie)
+/// Hash(SrcIP, SrcPort, DstIP, DstPort, Secret, ClientISN)
+pub fn generate_syn_cookie(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dest_ip: Ipv4Addr,
+    dest_port: u16,
+    client_isn: u32
+) -> u32 {
+    let mut hasher = JenkinsHasher::new();
+    hasher.write(&src_ip.octets());
+    hasher.write_u16(src_port);
+    hasher.write(&dest_ip.octets());
+    hasher.write_u16(dest_port);
+    hasher.write_u32(client_isn);
+    hasher.write_u64(SECRET_KEY);
+
+    // We truncate the 64-bit hash to 32 bits for the Sequence Number
+    hasher.finish() as u32
+}
