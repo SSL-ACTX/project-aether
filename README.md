@@ -1,129 +1,138 @@
 <div align="center">
 
-![Aether Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:00ff&height=220&section=header&text=Project%20Aether&fontSize=80&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&desc=Hybrid%20Kernel-Bypass%20TCP/IP%20Stack&descSize=20&descAlignY=55)
+![Aether Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:00ff&height=220&section=header&text=Project%20Aether&fontSize=80&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&desc=Experimental%20Rust%20TCP/IP%20Stack&descSize=20&descAlignY=55)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge&logo=open-source-initiative)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/Rust-Latest-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Linux_TAP-lightgrey.svg?style=for-the-badge&logo=linux)]()
-[![Performance](https://img.shields.io/badge/Perf-3.1k_CPS-success.svg?style=for-the-badge&logo=speedtest)]()
-[![Status](https://img.shields.io/badge/Status-Archived%20(Success)-success.svg?style=for-the-badge&logo=github)]()
+[![Status](https://img.shields.io/badge/Status-Experimental%20Prototype-red.svg?style=for-the-badge)]()
+[![IPv6](https://img.shields.io/badge/IPv6-Not%20Supported-critical.svg?style=for-the-badge)]()
 
 </div>
+
+---
+
+> [!WARNING]
+> **🚧 EXPERIMENTAL / EDUCATIONAL ONLY 🚧**
+>
+> **Project Aether is a learning experiment, not a production network stack.**
+>
+> Unlike mature user-space stacks (e.g., *smoltcp*, *VPP*, or *lwIP*) or the standard Linux kernel, Aether prioritizes code simplicity and raw throughput over correctness, reliability, and standards compliance. It is **not** suitable for general internet use.
 
 ---
 
 ## ⚡ Overview
 
-**Project Aether** is a high-performance, user-space TCP/IP stack written from scratch in Rust. It bypasses the standard Linux kernel networking stack (`netfilter`, `conntrack`, routing tables) to communicate directly with a **TAP interface** via raw Ethernet frames.
+**Project Aether** is a custom, `no_std`-compatible TCP/IP implementation written from scratch in Rust. It bypasses the Linux kernel networking stack (`netfilter`, routing tables, etc.) to communicate directly with a **TAP interface** via raw Ethernet frames.
 
-Designed to scale from legacy hardware to modern servers, Aether utilizes a **Hybrid Engine** that automatically switches between a low-overhead single-threaded loop and a sharded multi-threaded dispatcher based on CPU topology.
+The goal of this project was to explore the mechanics of the TCP 3-way handshake, zero-copy packet processing, and custom concurrency models without the overhead of an operating system's full network subsystem.
 
+## 🛑 Scope & Limitations
 
-### 🚀 Performance Benchmark
-<div align="center">
+If you are looking for a usable TCP/IP stack for your Rust OS or embedded project, **this is probably not it**. Aether takes significant shortcuts to achieve high "benchmark" numbers on local connections:
 
-Running on a single-core **Intel Celeron 900 (2.2GHz, 2009)**:
+### 1. No IPv6 Support
+Aether is strictly **IPv4-only**. In an era where IPv6 is mandatory for general compliance, this stack is stuck in the past.
 
-| Metric | Result | Notes |
-| :--- | :--- | :--- |
-| **Throughput** | **3,109 Connections/Sec** | +43% vs initial prototype |
-| **Latency** | < 1ms (Local TAP) | Adaptive Backoff |
-| **Concurrency** | 100/100 Success | 100 Concurrent Threads |
-| **Memory** | Zero-Allocation Hot Path | `no_std` compatible logic |
+### 2. Zero Reliability Mechanisms
+To keep the engine extremely fast, we stripped out the safety features that make TCP "reliable":
+* **No Retransmission:** If a packet is dropped, the connection stalls and eventually times out. Aether never resends data.
+* **No Out-of-Order Handling:** Packets must arrive in perfect sequence. If packet 5 arrives before packet 4, packet 5 is dropped.
+* **No Fragmentation:** IP packets larger than the MTU (1514 bytes) are dropped.
 
-</div>
+### 3. Missing Congestion Control
+* **No Flow Control:** It sends data as fast as the wire allows. There is no "Slow Start," "Congestion Avoidance," or dynamic Window Scaling.
+* **Fixed Window:** The TCP Window size is hardcoded.
+
+### 4. Basic Security
+* While it implements **SYN Cookies** to prevent basic flood attacks, it lacks randomness in sequence number generation (predictable ISNs) and does not support TLS/SSL.
 
 ---
 
 ## 🏗 Architecture
 
-Aether abandons generic async runtimes for a custom, purpose-built event loop.
+Aether abandons generic async runtimes (Tokio/Async-std) for a custom, purpose-built event loop designed for specific CPU topologies.
 
 ### 1. Hybrid Engine (Auto-Scaling)
 At startup, Aether detects the available CPU cores:
-* **Legacy Mode (≤ 2 Cores):** Runs a **Single-Threaded** zero-copy loop. Eliminates context switching and synchronization overhead for maximum efficiency on constrained hardware.
-* **Turbo Mode (> 2 Cores):** Activates a **Sharded Dispatcher**. Spawns worker threads equal to the core count and distributes connections via `Hash(SrcIP, SrcPort)` sharding.
+* **Single-Threaded Mode:** On single-core VMs or legacy hardware, it runs a zero-copy spin-loop. This eliminates context switching and synchronization overhead.
+* **Sharded Multi-Threaded Mode:** On multi-core systems, it spawns worker threads and distributes traffic using a 2-tuple hash `(SrcIP, SrcPort) % workers`.
 
 ### 2. Adaptive Backoff
-To prevent 100% CPU usage during idle times (a common issue in spin-loops), the main loop implements a 3-stage state machine:
-1.  **Spin:** Nanosecond-level polling under high load.
-2.  **Yield:** Relinquishes CPU time slice during moderate traffic.
-3.  **Sleep:** Micro-sleep (50µs) during idle periods to drop CPU usage to ~1%.
-
-### 3. "Burst" Processing
-* **Batch I/O:** Reads up to **128 packets** per syscall using non-blocking I/O.
-* **Zero-Copy Parsing:** Packets are parsed in-place using slice references. No heap allocations occur during the TCP handshake.
+To prevent the stack from burning 100% CPU while waiting for packets (a common issue in naive DPDK/kernel-bypass apps), the main loop implements a state machine:
+1.  **Spin:** Nanosecond polling for high-load bursts.
+2.  **Yield:** Relinquishes CPU time slice.
+3.  **Sleep:** Micro-sleep (50µs) during total silence.
 
 ---
 
-## 🛠 Features Implemented
+## 🛠 Feature Support
 
-* **L2 Data Link:** Raw Ethernet frame parsing & ARP (Request/Reply).
-* **L3 Network:** IPv4 header validation & Checksum offloading.
-* **L3 ICMP:** Echo Request/Reply (Ping).
-* **L4 TCP:**
-    * Full 3-Way Handshake (SYN, SYN-ACK, ACK).
-    * **Security:** Cryptographic SYN Cookies (Stateless flood protection).
-    * **Flow:** Sequence Number Synchronization & FIN/RST teardown.
-* **L7 Application:**
-    * **HTTP/1.1:** Static content server.
-    * **DHCP:** Dynamic IP negotiation (Discover/Offer/Request/Ack).
-    * **DNS:** Packet parsing and logging stub.
+Despite its limitations, Aether successfully implements enough of the protocol suite to serve a basic webpage and negotiate an IP address.
+
+| Layer | Protocol | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **L2** | **Ethernet** | ✅ | Frame parsing, broadcast handling |
+| **L2** | **ARP** | ✅ | Request & Reply (Hardware Address Resolution) |
+| **L3** | **IPv4** | ⚠️ | Header validation only (No frag, options, or TTL processing) |
+| **L3** | **ICMP** | ✅ | Echo Request/Reply (Ping) |
+| **L4** | **TCP** | ⚠️ | 3-Way Handshake, PSH, FIN, RST (No Re-Tx, SACK, Window Scale) |
+| **L4** | **UDP** | ✅ | Basic datagram parsing |
+| **L7** | **DHCP** | ✅ | DORA Sequence (Discover, Offer, Request, Ack) |
+| **L7** | **DNS** | ❌ | Parsing stub only (No resolution logic) |
+| **L7** | **HTTP** | ⚠️ | Static HTML responder (GET / only) |
+
+---
+
+## 🚀 Performance Benchmark
+
+Running on a single-core **Intel Celeron 900 (2.2GHz, 2009)** context:
+
+| Metric | Result | Context |
+| :--- | :--- | :--- |
+| **Throughput** | **3,109 Req/Sec** | Local TAP interface, HTTP Keep-Alive disabled |
+| **Latency** | < 1ms | Local loopback equivalent |
+| **Concurrency** | 100 Concurrent | Validated with Python stress script |
+
+*Note: These numbers represent raw packet processing speed in a controlled environment. Real-world performance over a physical NIC would be significantly lower due to the lack of congestion control.*
 
 ---
 
 ## 📦 Installation & Usage
 
 ### Prerequisites
-* Linux (Root privileges required for TAP creation).
-* Rust (Cargo).
+* Linux Kernel (Required for `TAP` device creation)
+* Rust (Cargo)
+* Root/Sudo privileges (to configure the network interface)
 
 ### Quick Start
-Use the automated setup script to build the optimized binary and configure the interface.
 
-```bash
-# 1. Clone and Setup
-git clone https://github.com/SSL-ACTX/project-aether
-chmod +x setup.sh
+1.  **Build the Project:**
+    ```bash
+    cargo build --release
+    ```
 
-# 2. Launch
-./setup.sh
+2.  **Setup the TAP Interface:**
+    You need to create a persistent TAP device and assign it an IP.
+    ```bash
+    sudo ip tuntap add mode tap user $USER name aether0
+    sudo ip link set aether0 up
+    sudo ip addr add 192.168.1.1/24 dev aether0
+    ```
 
-```
-> [!NOTE]
-> *`setup.sh` defaults to the debug binary. Edit `BINARY` in the script to point to `./target/release/aether` for maximum speed.*
+3.  **Run Aether:**
+    ```bash
+    # Must run with access to the TAP device
+    ./target/release/aether
+    ```
 
-### Verification tools
+4.  **Test Connectivity:**
+    ```bash
+    # Ping the stack
+    ping 192.168.1.2
 
-```bash
-# Ping the stack
-ping 192.168.1.2
-
-# Test HTTP Server
-curl http://192.168.1.2/
-
-# Run the Full Verification Suite
-python3 test_stack.py --ip 192.168.1.2
-
-# Run the Stress Benchmark
-python3 benchmark.py --ip 192.168.1.2 --threads 100
-
-```
-
----
-
-## ⚠️ Engineering Trade-offs
-
-**"Speed over Safety"**
-
-To achieve maximum throughput on legacy hardware, this implementation makes specific reliability trade-offs:
-
-1. **No Retransmission Queue:** Aether does not buffer outgoing packets or implement Retransmission Timeouts (RTO). Reliability relies on the client's TCP stack to resend lost segments.
-2. **Reactive Integrity:** Duplicate packets are detected and ACK'd immediately, but the stack does not actively probe for unacknowledged data.
-3. **Fixed Window:** Flow control is static; congestion control (Slow Start, Congestion Avoidance) is omitted to reduce CPU cycles per connection.
-
-> [!IMPORTANT]
-> **This stack is purpose-built for high-speed, low-latency environments where packet loss is negligible (e.g., virtualization, local IPC, specialized appliances).**
+    # HTTP Request
+    curl http://192.168.1.2/
+    ```
 
 ---
 
